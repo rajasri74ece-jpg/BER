@@ -1,0 +1,258 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from math import erfc, sqrt
+
+# ==========================================================
+# ADAPTIVE MONTE CARLO BER SIMULATION
+# Modulations: BPSK, QPSK and 16-QAM
+# ==========================================================
+
+np.random.seed(42)
+
+EBN0_DB = np.arange(-4, 17, 2)
+MAX_ERRORS = 200
+MAX_BITS = 10**6
+CHUNK_BITS = 20000
+
+
+# ---------- Constellation generation ----------
+
+def create_constellation(modulation):
+    k = {"BPSK": 1, "QPSK": 2, "16-QAM": 4}[modulation]
+    M = 2**k
+
+    bit_table = (
+        (np.arange(M)[:, None] >> np.arange(k-1, -1, -1)) & 1
+    )
+
+    if modulation == "BPSK":
+        symbols = (1 - 2*bit_table[:, 0]).astype(complex)
+
+    elif modulation == "QPSK":
+        i = 1 - 2*bit_table[:, 0]
+        q = 1 - 2*bit_table[:, 1]
+        symbols = (i + 1j*q) / np.sqrt(2)
+
+    else:  # Gray-coded square 16-QAM
+        i = (2*bit_table[:, 0] - 1) * (3 - 2*bit_table[:, 1])
+        q = (2*bit_table[:, 2] - 1) * (3 - 2*bit_table[:, 3])
+        symbols = (i + 1j*q) / np.sqrt(10)
+
+    # Explicit average symbol energy normalization
+    symbols = symbols / np.sqrt(np.mean(np.abs(symbols)**2))
+
+    return bit_table, symbols, k
+
+
+# ---------- Nearest-neighbor detector ----------
+
+def detect_symbols(received, constellation, bit_table):
+    distances = np.abs(
+        received[:, None] - constellation[None, :]
+    )**2
+
+    detected_indices = np.argmin(distances, axis=1)
+    return bit_table[detected_indices]
+
+
+# ---------- Theoretical BER ----------
+
+def Q_function(x):
+    return np.array([
+        0.5 * erfc(float(v) / sqrt(2)) for v in np.ravel(x)
+    ]).reshape(np.shape(x))
+
+
+def theoretical_ber(modulation, ebn0_db):
+    gamma_b = 10**(np.asarray(ebn0_db) / 10)
+
+    if modulation in ("BPSK", "QPSK"):
+        return Q_function(np.sqrt(2 * gamma_b))
+
+    # Standard Gray-coded square 16-QAM approximation
+    M = 16
+    k = 4
+    return (4/k) * (1 - 1/np.sqrt(M)) * Q_function(
+        np.sqrt(3*k*gamma_b/(M-1))
+    )
+
+
+# ---------- Adaptive Monte Carlo BER driver ----------
+
+def simulate_ber(modulation, ebn0_db):
+    bit_table, constellation, k = create_constellation(modulation)
+
+    ber_values = []
+    error_counts = []
+    bit_counts = []
+
+    # Explicit Eb/N0 and complex-noise variance
+    Es = np.mean(np.abs(constellation)**2)
+    Eb = Es / k
+
+    # Verify normalized constellation
+    assert np.isclose(Es, 1.0)
+
+    for db in ebn0_db:
+        ebn0_linear = 10**(db / 10)
+        N0 = Eb / ebn0_linear
+
+        # Complex noise: E[|n|^2] = N0
+        noise_variance_complex = N0
+        noise_std_per_dimension = np.sqrt(N0 / 2)
+
+        errors = 0
+        total_bits = 0
+
+        while errors < MAX_ERRORS and total_bits < MAX_BITS:
+            remaining = MAX_BITS - total_bits
+            batch_bits = min(CHUNK_BITS, remaining)
+            batch_symbols = max(1, batch_bits // k)
+
+            # Generate random information bits
+            tx_bits = np.random.randint(
+                0, 2, size=(batch_symbols, k)
+            )
+
+            # Map bits to constellation symbols
+            indices = tx_bits.dot(
+                2**np.arange(k-1, -1, -1)
+            )
+            tx_symbols = constellation[indices]
+
+            # Add complex AWGN
+            noise = noise_std_per_dimension * (
+                np.random.randn(batch_symbols)
+                + 1j*np.random.randn(batch_symbols)
+            )
+
+            rx_symbols = tx_symbols + noise
+
+            # Detect symbols and compare transmitted bits
+            rx_bits = detect_symbols(
+                rx_symbols, constellation, bit_table
+            )
+
+            errors += np.count_nonzero(tx_bits != rx_bits)
+            total_bits += tx_bits.size
+
+        ber = errors / total_bits
+        ber_values.append(ber)
+        error_counts.append(errors)
+        bit_counts.append(total_bits)
+
+        print(
+            f"{modulation:6s} | Eb/N0 = {db:>3} dB | "
+            f"Errors = {errors:3d} | Bits = {total_bits:7d} | "
+            f"BER = {ber:.6e} | Noise variance = "
+            f"{noise_variance_complex:.4e}"
+        )
+
+    return np.array(ber_values), error_counts, bit_counts
+
+
+# ---------- Mandatory validation ----------
+
+def validate_detector():
+    print("\n--- HIGH-SNR / NOISELESS VALIDATION ---")
+
+    for modulation in ("BPSK", "QPSK", "16-QAM"):
+        bit_table, constellation, k = create_constellation(modulation)
+
+        # Test every possible symbol with zero noise
+        detected = detect_symbols(
+            constellation, constellation, bit_table
+        )
+
+        assert np.array_equal(detected, bit_table)
+        print(f"{modulation}: PASS - noiseless detection is exact")
+
+    print("\n--- LOW-SNR RANDOM-DECISION VALIDATION ---")
+
+    # At very low SNR, detected bits should approach random decisions.
+    n_symbols = 20000
+    for modulation in ("BPSK", "QPSK", "16-QAM"):
+        bit_table, constellation, k = create_constellation(modulation)
+
+        tx_bits = np.random.randint(0, 2, (n_symbols, k))
+        indices = tx_bits.dot(2**np.arange(k-1, -1, -1))
+        tx_symbols = constellation[indices]
+
+        # -15 dB Eb/N0
+        ebn0_linear = 10**(-15/10)
+        N0 = (np.mean(np.abs(constellation)**2) / k) / ebn0_linear
+
+        noise = np.sqrt(N0/2) * (
+            np.random.randn(n_symbols)
+            + 1j*np.random.randn(n_symbols)
+        )
+
+        rx_bits = detect_symbols(
+            tx_symbols + noise, constellation, bit_table
+        )
+
+        ber = np.mean(tx_bits != rx_bits)
+        print(f"{modulation}: low-SNR BER = {ber:.4f} "
+              f"(random-decision limit = 0.5)")
+
+
+# ---------- Run simulation ----------
+
+validate_detector()
+
+results = {}
+
+for modulation in ("BPSK", "QPSK", "16-QAM"):
+    ber, errors, bits = simulate_ber(modulation, EBN0_DB)
+    results[modulation] = {
+        "ber": ber,
+        "errors": errors,
+        "bits": bits
+    }
+
+
+# ---------- Plot BER and theory ----------
+
+plt.figure(figsize=(10, 6))
+
+for modulation in ("BPSK", "QPSK", "16-QAM"):
+    ber = results[modulation]["ber"]
+
+    # Zero observed errors cannot be plotted on a log axis.
+    # Use NaN for plotting only; retain actual BER in results.
+    plot_ber = np.where(ber > 0, ber, np.nan)
+
+    plt.semilogy(
+        EBN0_DB, plot_ber, "o-",
+        label=f"{modulation} Monte Carlo"
+    )
+
+    theory = theoretical_ber(modulation, EBN0_DB)
+    plt.semilogy(
+        EBN0_DB, theory, "--",
+        label=f"{modulation} Theory"
+    )
+
+plt.xlabel(r"$E_b/N_0$ (dB)")
+plt.ylabel("Bit Error Rate (BER)")
+plt.title("Adaptive Monte Carlo BER Performance")
+plt.grid(True, which="both", linestyle=":")
+plt.legend()
+plt.ylim(1e-6, 1)
+plt.tight_layout()
+plt.show()
+
+
+# ---------- Final results table ----------
+
+print("\n--- FINAL BER RESULTS ---")
+print("Modulation | Eb/N0(dB) | Errors | Bits | BER")
+
+for modulation, data in results.items():
+    for i, db in enumerate(EBN0_DB):
+        print(
+            f"{modulation:10s} | {db:>3} | "
+            f"{data['errors'][i]:>6} | "
+            f"{data['bits'][i]:>7} | "
+            f"{data['ber'][i]:.6e}"
+        )
